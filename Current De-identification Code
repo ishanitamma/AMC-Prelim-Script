@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+Anonymize patient videos by adding a black bar over the eyes.
+
+This script preserves the original video and creates an anonymized copy
+with a black bar over the eye region for patient confidentiality.
+
+Usage:
+    python anonymize_video.py input_video.mp4
+    python anonymize_video.py input_video.mp4 --output anonymized.mp4
+    python anonymize_video.py input_video.mp4 --bar-height 0.25
+    python anonymize_video.py /path/to/videos/*.mp4  # Batch processing
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+class VideoAnonymizer:
+    """Anonymizes videos by adding a black bar over the eyes using Haar cascade."""
+
+    def __init__(self, bar_height_ratio: float = 0.35, bar_padding_ratio: float = 0.2,
+                 detection_scale: float = 0.5):
+        """
+        Initialize the anonymizer.
+
+        Args:
+            bar_height_ratio: Height of bar relative to face height (default 0.35)
+            bar_padding_ratio: Extra padding on sides as ratio of face width (default 0.2)
+            detection_scale: Scale factor for detection (smaller = faster but less accurate)
+        """
+        self.bar_height_ratio = bar_height_ratio
+        self.bar_padding_ratio = bar_padding_ratio
+        self.detection_scale = detection_scale
+
+        # Initialize Haar cascades
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        self.profile_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_profileface.xml'
+        )
+
+        # Track last known face position for smoothing
+        self.last_face_box = None
+        self.frames_since_detection = 0
+        self.max_frames_without_detection = 90  # Hold position for 3 seconds at 30fps
+
+        # Frame dimensions (set during processing)
+        self.frame_height = 0
+        self.frame_width = 0
+
+    def validate_face(self, face_box):
+        """
+        Validate that the detected face is reasonable.
+
+        Returns True if the face is likely real, False if it's probably a false positive.
+        """
+        x, y, w, h = face_box
+
+        # Face should be in the upper 50% of the frame (not in torso/legs area)
+        face_center_y = y + h / 2
+        if face_center_y > self.frame_height * 0.50:
+            return False
+
+        # Face width should be at least 3% of frame width
+        if w < self.frame_width * 0.03:
+            return False
+
+        # Face width should be less than 60% of frame width (not too big)
+        if w > self.frame_width * 0.6:
+            return False
+
+        # Face aspect ratio should be roughly square (0.5 to 1.8 for profiles)
+        aspect = w / h
+        if aspect < 0.5 or aspect > 1.8:
+            return False
+
+        return True
+
+    def detect_face(self, frame):
+        """Detect face using Haar cascade with validation."""
+        # Scale down for faster detection
+        small_h = int(frame.shape[0] * self.detection_scale)
+        small_w = int(frame.shape[1] * self.detection_scale)
+        small_frame = cv2.resize(frame, (small_w, small_h))
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+
+        # Try frontal face detection with relaxed parameters
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,  # More sensitive
+            minNeighbors=3,    # More detections
+            minSize=(30, 30)
+        )
+
+        # If no frontal face, try profile (both directions)
+        if len(faces) == 0:
+            faces = self.profile_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.05,
+                minNeighbors=3,
+                minSize=(30, 30)
+            )
+
+        # Try flipped image for opposite profile
+        if len(faces) == 0:
+            gray_flipped = cv2.flip(gray, 1)
+            faces_flipped = self.profile_cascade.detectMultiScale(
+                gray_flipped,
+                scaleFactor=1.05,
+                minNeighbors=3,
+                minSize=(30, 30)
+            )
+            # Flip coordinates back
+            if len(faces_flipped) > 0:
+                faces = []
+                for (x, y, w, h) in faces_flipped:
+                    x_flipped = small_w - x - w
+                    faces.append((x_flipped, y, w, h))
+                faces = np.array(faces)
+
+        if len(faces) == 0:
+            return None
+
+        # Scale back to original size and validate
+        valid_faces = []
+        for (x, y, w, h) in faces:
+            # Scale coordinates back to original
+            x_orig = int(x / self.detection_scale)
+            y_orig = int(y / self.detection_scale)
+            w_orig = int(w / self.detection_scale)
+            h_orig = int(h / self.detection_scale)
+
+            face_box = (x_orig, y_orig, w_orig, h_orig)
+
+            if self.validate_face(face_box):
+                valid_faces.append(face_box)
+
+        if len(valid_faces) == 0:
+            return None
+
+        # Return the largest valid face
+        largest = max(valid_faces, key=lambda f: f[2] * f[3])
+        return largest
+
+    def calculate_eye_bar_region(self, face_box):
+        """Calculate the black bar region to cover eyes based on face bounding box."""
+        x, y, w, h = face_box
+
+        # Eye region is typically at 30-45% from top of face bounding box
+        # Haar cascade box usually includes forehead, so eyes are lower than you'd think
+        eye_y_start = y + int(h * 0.28)
+        eye_y_end = y + int(h * (0.28 + self.bar_height_ratio))
+
+        # Add padding to sides
+        padding = int(w * self.bar_padding_ratio)
+        bar_x_start = max(0, x - padding)
+        bar_x_end = min(self.frame_width, x + w + padding)
+
+        # Clamp to frame boundaries
+        eye_y_start = max(0, eye_y_start)
+        eye_y_end = min(self.frame_height, eye_y_end)
+
+        return (bar_x_start, eye_y_start, bar_x_end, eye_y_end)
+
+    def smooth_box(self, new_box, alpha=0.7):
+        """Smooth face box transitions to reduce jitter."""
+        if self.last_face_box is None:
+            return new_box
+
+        # Only smooth if the new detection is close to the old one
+        old_center_x = self.last_face_box[0] + self.last_face_box[2] / 2
+        old_center_y = self.last_face_box[1] + self.last_face_box[3] / 2
+        new_center_x = new_box[0] + new_box[2] / 2
+        new_center_y = new_box[1] + new_box[3] / 2
+
+        # If the face jumped too far, don't smooth (probably a different detection)
+        distance = ((new_center_x - old_center_x)**2 + (new_center_y - old_center_y)**2)**0.5
+        if distance > self.frame_width * 0.2:  # More than 20% of frame width
+            return new_box
+
+        smoothed = tuple(
+            int(alpha * new + (1 - alpha) * old)
+            for new, old in zip(new_box, self.last_face_box)
+        )
+        return smoothed
+
+    def apply_black_bar(self, frame, bar_region):
+        """Apply black bar to frame using cv2.rectangle."""
+        x1, y1, x2, y2 = bar_region
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
+        return frame
+
+    def process_frame(self, frame):
+        """Process a single frame and return anonymized version."""
+        face_box = self.detect_face(frame)
+
+        if face_box is not None:
+            # Smooth the detection
+            face_box = self.smooth_box(face_box)
+            self.last_face_box = face_box
+            self.frames_since_detection = 0
+
+            # Calculate and apply black bar
+            bar_region = self.calculate_eye_bar_region(face_box)
+            frame = self.apply_black_bar(frame, bar_region)
+            return frame, True
+
+        elif self.last_face_box is not None and self.frames_since_detection < self.max_frames_without_detection:
+            # Use last known position if detection temporarily fails
+            self.frames_since_detection += 1
+            bar_region = self.calculate_eye_bar_region(self.last_face_box)
+            frame = self.apply_black_bar(frame, bar_region)
+            return frame, False  # Using cached position
+
+        self.frames_since_detection += 1
+        return frame, False  # No detection and no cache
+
+    def process_video(self, input_path: str, output_path: str = None) -> str:
+        """
+        Process a video and create anonymized version.
+
+        Args:
+            input_path: Path to input video
+            output_path: Path for output video (auto-generated if None)
+
+        Returns:
+            Path to the anonymized video
+        """
+        input_path = Path(input_path)
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input video not found: {input_path}")
+
+        # Generate output path if not specified
+        if output_path is None:
+            output_path = input_path.parent / f"{input_path.stem}_anonymized{input_path.suffix}"
+        else:
+            output_path = Path(output_path)
+
+        # Open input video
+        cap = cv2.VideoCapture(str(input_path))
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {input_path}")
+
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        self.frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Set up video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(output_path), fourcc, fps, (self.frame_width, self.frame_height))
+
+        # Reset tracking state
+        self.last_face_box = None
+        self.frames_since_detection = 0
+
+        print(f"Processing: {input_path.name}")
+        print(f"  Resolution: {self.frame_width}x{self.frame_height} @ {fps:.1f} fps")
+        print(f"  Total frames: {total_frames}")
+        print(f"  Detection scale: {self.detection_scale}")
+        print(f"  Output: {output_path.name}")
+
+        frame_count = 0
+        faces_detected = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Process frame
+            anonymized_frame, detected = self.process_frame(frame)
+
+            if detected:
+                faces_detected += 1
+
+            out.write(anonymized_frame)
+
+            frame_count += 1
+            if frame_count % 100 == 0:
+                progress = (frame_count / total_frames) * 100
+                detection_rate = (faces_detected / frame_count) * 100
+                print(f"  Progress: {progress:.1f}% ({frame_count}/{total_frames}) - Fresh detections: {detection_rate:.1f}%")
+
+        cap.release()
+        out.release()
+
+        detection_rate = (faces_detected / frame_count) * 100 if frame_count > 0 else 0
+        print(f"  Complete! Fresh face detections: {detection_rate:.1f}% of frames")
+        print(f"  Original preserved: {input_path}")
+        print(f"  Anonymized video: {output_path}")
+
+        return str(output_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Anonymize patient videos by adding a black bar over the eyes.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python anonymize_video.py patient_video.mp4
+  python anonymize_video.py patient_video.mp4 --output anonymized.mp4
+  python anonymize_video.py videos/*.mp4 --output-dir anonymized_videos/
+  python anonymize_video.py patient_video.mp4 --bar-height 0.3
+
+The script preserves original videos and creates anonymized copies with
+'_anonymized' suffix by default.
+        """
+    )
+
+    parser.add_argument(
+        'input_videos',
+        nargs='+',
+        help='Input video file(s) to anonymize'
+    )
+
+    parser.add_argument(
+        '--output', '-o',
+        help='Output video path (only valid for single input)'
+    )
+
+    parser.add_argument(
+        '--output-dir',
+        help='Output directory for batch processing'
+    )
+
+    parser.add_argument(
+        '--bar-height',
+        type=float,
+        default=0.25,
+        help='Height of black bar relative to face height (default: 0.25)'
+    )
+
+    parser.add_argument(
+        '--scale',
+        type=float,
+        default=0.5,
+        help='Detection scale factor (default: 0.5, smaller = faster)'
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.output and len(args.input_videos) > 1:
+        print("Error: --output can only be used with a single input video")
+        print("Use --output-dir for batch processing")
+        sys.exit(1)
+
+    # Create anonymizer
+    anonymizer = VideoAnonymizer(
+        bar_height_ratio=args.bar_height,
+        detection_scale=args.scale
+    )
+
+    # Process videos
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    processed = []
+    failed = []
+
+    for input_video in args.input_videos:
+        try:
+            # Determine output path
+            if args.output:
+                output_path = args.output
+            elif output_dir:
+                input_name = Path(input_video).stem
+                output_path = output_dir / f"{input_name}_anonymized.mp4"
+            else:
+                output_path = None  # Auto-generate
+
+            result = anonymizer.process_video(input_video, output_path)
+            processed.append(result)
+            print()
+
+        except Exception as e:
+            print(f"Error processing {input_video}: {e}")
+            failed.append(input_video)
+            print()
+
+    # Summary
+    print("=" * 50)
+    print("Summary:")
+    print(f"  Processed: {len(processed)} videos")
+    if failed:
+        print(f"  Failed: {len(failed)} videos")
+        for f in failed:
+            print(f"    - {f}")
+
+    if processed:
+        print("\nAnonymized videos ready for distribution:")
+        for p in processed:
+            print(f"  {p}")
+
+
+if __name__ == '__main__':
+    main()
