@@ -20,7 +20,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-mp_face_mesh = mp.solutions.face_mesh
+
 
 # Indices of the eye landmarks in MediaPipe's 468-point face mesh
 # These trace the contour of each eye
@@ -139,6 +139,7 @@ def try_haar_fallback(frame, crop_x1, crop_y1, crop_x2, crop_y2, scale_up):
 # eyes are always blurred even when detection is unreliable.
 # -----------------------------------------------------------------------------
 def process_video(input_path, output_path):
+    mp_face_mesh = mp.solutions.face_mesh
     cap = cv2.VideoCapture(input_path)
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -232,4 +233,59 @@ def process_video(input_path, output_path):
     print(f"Done! Total: {frame_count} | Blacked: {blacked}") # input video path
     print(f"Saved to {output_path}") # output video path
 
-process_video("Clip2.mp4", "output.mp4")
+# process_video("arthrogryposis_video.mp4", "output.mp4")
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+import os
+
+
+def process_video_wrapper(video_file):
+    """
+    Worker function executed in a separate process.
+    """
+    input_path = str(video_file)
+
+    output_dir = Path("processed")
+    output_dir.mkdir(exist_ok=True)
+
+    output_path = output_dir / f"blurred_{video_file.name}"
+
+    print(f"Starting: {video_file.name}")
+
+    process_video(input_path, str(output_path))
+
+    print(f"Finished: {video_file.name}")
+
+    return video_file.name
+
+
+if __name__ == "__main__":
+
+    # Find all MP4 files in current directory
+    video_folder = Path(r"")
+    # video_files = list(Path(".").glob("*.mp4"))
+    video_files = list(video_folder.glob("*.mp4"))    
+
+    if not video_files:
+        print("No MP4 files found.")
+        exit()
+
+    print(f"Found {len(video_files)} videos.")
+    print("Processing up to 7 videos simultaneously...\n")
+
+    with ProcessPoolExecutor(max_workers=7) as executor:
+
+        futures = [
+            executor.submit(process_video_wrapper, video)
+            for video in video_files
+        ]
+
+        for future in as_completed(futures):
+            try:
+                completed_video = future.result()
+                print(f"Completed: {completed_video}")
+            except Exception as e:
+                print(f"Error: {e}")
+
+    print("\nAll videos processed.")
