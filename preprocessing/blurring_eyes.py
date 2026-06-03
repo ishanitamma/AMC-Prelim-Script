@@ -263,6 +263,7 @@ def process_video_wrapper(video_file):
 if __name__ == "__main__":
 
     # Find all MP4 files in current directory
+    ## Replace empty quotes with your path
     video_folder = Path(r"")
     # video_files = list(Path(".").glob("*.mp4"))
     video_files = list(video_folder.glob("*.mp4"))    
