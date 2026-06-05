@@ -5,8 +5,8 @@ from threading import Thread
 from queue import Queue
 
 # ── config ────────────────────────────────────────────────────────────────────
-SOURCE       = r"C:\Users\zuhai\Downloads\m6.mp4"
-OUTPUT       = r"C:\Users\zuhai\Downloads\move6_blurred.mp4"
+SOURCE       = r""
+OUTPUT       = r""
 DETECT_EVERY = 5      # re-run FaceDetection every N frames
 CROP_PAD     = 0.5   # padding around detected bbox
 MASK_DILATE = 30
