@@ -1,64 +1,140 @@
+"""
+blur_faces.py
+─────────────────────────────────────────────────────────────────────────────
+Patient face-blurring pipeline for clinical video recordings.
+
+Detection strategy (layered, in priority order):
+  1. MediaPipe FaceDetection  — primary detector, handles frontal + profile
+  2. OpenCV DNN (SSD ResNet)  — fallback when MediaPipe misses a frame
+  3. Last-known position      — covers short dropout bursts (≤ MAX_REUSE_FRAMES)
+  4. Black frame              — safest option when nothing else is available
+
+Key improvements over v1:
+  • Generous proportional box expansion (35 % of face size per side)
+  • Drift expansion — blur box grows slightly for each consecutive missed frame
+  • Second detector (OpenCV DNN) eliminates most inter-detector blind spots
+  • Faster EMA (alpha 0.75) keeps the blur box on fast-moving faces
+  • MAX_REUSE_FRAMES hard cap prevents a stale box from persisting indefinitely
+
+Dependencies:
+  pip install opencv-python mediapipe numpy
+
+OpenCV DNN model files (place alongside this script, or update the paths):
+  deploy.prototxt
+  res10_300x300_ssd_iter_140000.caffemodel
+  Download from:
+  https://github.com/opencv/opencv/tree/master/samples/dnn/face_detector
+"""
+
 import cv2
 import mediapipe as mp
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import time
 
 
-# =============================================================================
-# BLUR HELPERS
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# TUNEABLE CONSTANTS  (adjust here rather than hunting through the code)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def blur_face(frame, box, ksize=151, sigma=50):
+# How far the blur box extends beyond the detected face (fraction of face size).
+# 0.35 = 35 % extra on every side — covers hair, ears, and detection jitter.
+BOX_PAD_FRAC = 0.35
+
+# Exponential Moving Average weight on the *new* detection.
+# Higher → box tracks the face faster; lower → smoother but lags behind.
+EMA_ALPHA = 0.75
+
+# Maximum number of consecutive frames we will reuse the last known position
+# before giving up and writing a black frame instead.
+MAX_REUSE_FRAMES = 15
+
+# Extra pixels added to the blur box per consecutive missed frame, so the box
+# expands to chase a moving face during a detection dropout.
+DRIFT_PAD_PER_FRAME = 3      # pixels/frame
+DRIFT_PAD_MAX       = 40     # cap so the box doesn't grow unboundedly
+
+# IoU threshold above which two boxes are treated as the same face.
+IOU_THRESH = 0.30
+
+# Maximum centre-to-centre distance (pixels) between a new box and the
+# nearest previously-known face. Boxes beyond this are rejected as false
+# positives.
+PROXIMITY_MAX_DIST = 250
+
+# MediaPipe FaceDetection settings
+MP_MODEL_SELECTION      = 1     # 1 = full-range model (up to ~5 m)
+MP_MIN_CONFIDENCE       = 0.45  # slightly below 0.5 to catch difficult angles
+
+# OpenCV DNN FaceDetector settings
+DNN_CONF_THRESH         = 0.50  # minimum confidence to accept a DNN detection
+DNN_PROTOTXT            = "deploy.prototxt"
+DNN_CAFFEMODEL          = "res10_300x300_ssd_iter_140000.caffemodel"
+
+# Gaussian blur parameters for the face region
+BLUR_KSIZE = 151   # kernel size — must be odd; larger = blurrier
+BLUR_SIGMA = 50    # Gaussian sigma; larger = blurrier
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BLUR HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def blur_face(frame: np.ndarray, box: tuple) -> None:
     """
-    Apply a heavy Gaussian blur to a rectangular region of a frame in-place.
+    Apply heavy Gaussian blur to a rectangular region of a frame in-place.
 
     Parameters
     ----------
-    frame        : full BGR video frame (numpy array), modified in-place
-    box          : (x1, y1, x2, y2) pixel coordinates of the region to blur
-    ksize        : kernel size for GaussianBlur — must be odd; larger = blurrier
-    sigma        : standard deviation of the Gaussian; larger = blurrier
-
-    The guard clauses prevent crashes when the box is zero-size or outside
-    the frame boundaries (can happen at frame edges after padding).
+    frame : full BGR video frame (numpy array), modified in-place
+    box   : (x1, y1, x2, y2) pixel coordinates of the region to blur
     """
     x1, y1, x2, y2 = box
     if x2 <= x1 or y2 <= y1:
-        return  # degenerate box — nothing to blur
+        return
     region = frame[y1:y2, x1:x2]
     if region.size == 0:
-        return  # empty slice (can happen at frame edges)
-    frame[y1:y2, x1:x2] = cv2.GaussianBlur(region, (ksize, ksize), sigma)
+        return
+    frame[y1:y2, x1:x2] = cv2.GaussianBlur(region, (BLUR_KSIZE, BLUR_KSIZE), BLUR_SIGMA)
 
 
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # BOX UTILITIES
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
-def deduplicate_boxes(boxes, iou_thresh=0.3):
+def expand_box(box: tuple, frame_w: int, frame_h: int,
+               pad_frac: float = BOX_PAD_FRAC,
+               extra_px: int = 0) -> tuple:
     """
-    Remove duplicate/overlapping bounding boxes using Intersection over Union (IoU).
-
-    When FaceDetection returns multiple detections that overlap the same face,
-    this function keeps only one. It discards any new box whose IoU with an
-    already-kept box exceeds iou_thresh.
-
-    IoU = intersection_area / union_area
-      - IoU 1.0 → boxes are identical
-      - IoU 0.0 → boxes don't overlap at all
-      - iou_thresh=0.3 means "if 30% of the combined area is shared, treat
-        as the same face and discard the duplicate"
+    Expand a bounding box outward by a fraction of its own size, plus an
+    optional flat pixel amount, clamped to the frame boundaries.
 
     Parameters
     ----------
-    boxes      : list of (x1, y1, x2, y2) tuples
-    iou_thresh : overlap fraction above which a box is considered a duplicate
+    box      : (x1, y1, x2, y2)
+    frame_w  : frame width  in pixels
+    frame_h  : frame height in pixels
+    pad_frac : fractional padding (BOX_PAD_FRAC default)
+    extra_px : additional flat padding in pixels (used for drift expansion)
+    """
+    x1, y1, x2, y2 = box
+    bw = x2 - x1
+    bh = y2 - y1
+    pad_x = int(bw * pad_frac) + extra_px
+    pad_y = int(bh * pad_frac) + extra_px
+    return (
+        max(0,       x1 - pad_x),
+        max(0,       y1 - pad_y),
+        min(frame_w, x2 + pad_x),
+        min(frame_h, y2 + pad_y),
+    )
 
-    Returns
-    -------
-    Deduplicated list of boxes (order-preserving — first detection wins).
+
+def deduplicate_boxes(boxes: list, iou_thresh: float = IOU_THRESH) -> list:
+    """
+    Remove overlapping bounding boxes using Intersection over Union (IoU).
+    Keeps the first occurrence; discards subsequent boxes that overlap it
+    by more than iou_thresh.
     """
     if not boxes:
         return []
@@ -72,7 +148,7 @@ def deduplicate_boxes(boxes, iou_thresh=0.3):
             inter   = inter_w * inter_h
             area1   = (x2 - x1) * (y2 - y1)
             area2   = (kx2 - kx1) * (ky2 - ky1)
-            iou     = inter / (area1 + area2 - inter + 1e-6)  # +epsilon avoids /0
+            iou     = inter / (area1 + area2 - inter + 1e-6)
             if iou > iou_thresh:
                 duplicate = True
                 break
@@ -81,124 +157,129 @@ def deduplicate_boxes(boxes, iou_thresh=0.3):
     return kept
 
 
-def filter_by_proximity(new_boxes, last_boxes, max_dist=250):
+def filter_by_proximity(new_boxes: list, last_boxes: list,
+                        max_dist: float = PROXIMITY_MAX_DIST) -> list:
     """
-    Discard any detected box whose centre is more than max_dist pixels away
-    from every previously-known face position.
+    Discard new boxes whose centre is further than max_dist pixels from
+    every previously-known face position.
 
-    WHY THIS MATTERS
-    ----------------
-    False positives from FaceDetection tend to appear at random locations —
-    a wall texture, piece of equipment, clothing pattern, etc. Real faces
-    move smoothly between frames and do not teleport hundreds of pixels
-    in a single frame.
-
-    By rejecting boxes implausibly far from the last known face position,
-    we eliminate the vast majority of false positives without needing a
-    second detector or complex filtering.
-
-    Special case: if last_boxes is None/empty (very first frames before any
-    face has been seen), all boxes are accepted unconditionally — there is
-    no reference position to compare against yet.
-
-    Parameters
-    ----------
-    new_boxes : newly detected boxes this frame
-    last_boxes: boxes from the most recent reliable detection
-    max_dist  : maximum allowed distance (pixels) between box centres
+    If last_boxes is None or empty (start of video), all boxes are accepted.
     """
     if not last_boxes:
-        return new_boxes  # no prior reference — accept everything
+        return new_boxes
     result = []
     for box in new_boxes:
-        cx = (box[0] + box[2]) / 2   # centre-x of candidate box
-        cy = (box[1] + box[3]) / 2   # centre-y of candidate box
-        for (lx1, ly1, lx2, ly2) in last_boxes:
-            lcx = (lx1 + lx2) / 2   # centre-x of last known face
-            lcy = (ly1 + ly2) / 2   # centre-y of last known face
-            dist = ((cx - lcx) ** 2 + (cy - lcy) ** 2) ** 0.5  # Euclidean distance
+        cx = (box[0] + box[2]) / 2
+        cy = (box[1] + box[3]) / 2
+        for lx1, ly1, lx2, ly2 in last_boxes:
+            dist = ((cx - (lx1 + lx2) / 2) ** 2 +
+                    (cy - (ly1 + ly2) / 2) ** 2) ** 0.5
             if dist < max_dist:
                 result.append(box)
-                break  # matched a known face — no need to check others
+                break
     return result
 
 
-def smooth_box(prev, curr, alpha=0.55):
+def smooth_box(prev: tuple, curr: tuple, alpha: float = EMA_ALPHA) -> tuple:
     """
-    Exponential Moving Average (EMA) blend between a previous and current box.
-
-    Without smoothing, small jitter in detection output causes the blur
-    rectangle to visibly jump around each frame. EMA blending produces a
-    smoothly-gliding box that tracks the face without snapping.
-
-    alpha controls how quickly the box responds to new detections:
-      - alpha=1.0 → always use the new detection exactly (no smoothing)
-      - alpha=0.0 → never move from the original position
-      - alpha=0.55 → 55% weight on new detection, 45% on history
-                     (slightly conservative for stability on side-view footage
-                      where detection confidence fluctuates more)
-
-    Returns a new box tuple with integer pixel coordinates.
+    Exponential Moving Average blend between a previous and current box.
+    alpha=1.0 → use new detection exactly; alpha=0.0 → never move.
     """
     return tuple(int(alpha * c + (1 - alpha) * p) for p, c in zip(prev, curr))
 
 
-def update_boxes(last_boxes, new_boxes, alpha=0.55):
+def update_boxes(last_boxes: list, new_boxes: list,
+                 alpha: float = EMA_ALPHA) -> list:
     """
-    Apply EMA smoothing to a list of face boxes frame-to-frame.
-
-    If the number of detected faces changes (e.g. a second person walks in),
-    there is no sensible 1-to-1 pairing between old and new boxes, so we
-    hard-update instead of blending to avoid mixing up different faces.
-
-    Parameters
-    ----------
-    last_boxes : list of boxes from the previous frame
-    new_boxes  : list of boxes just detected this frame
-    alpha      : EMA weight on the new detection (passed to smooth_box)
+    Apply EMA smoothing frame-to-frame.
+    If the face count changes, hard-update (no blending) to avoid mixing
+    boxes from different faces.
     """
     if last_boxes and len(new_boxes) == len(last_boxes):
-        # Same number of faces — pair by index and blend each box
         return [smooth_box(p, c, alpha) for p, c in zip(last_boxes, new_boxes)]
-    # Different face count — hard update, no blending
-    return new_boxes
+    return new_boxes  # hard update
 
 
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# DNN DETECTOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_dnn_detector(prototxt: str = DNN_PROTOTXT,
+                      caffemodel: str = DNN_CAFFEMODEL):
+    """
+    Load the OpenCV DNN (SSD ResNet) face detector.
+    Returns the net, or None if the model files are not found.
+    """
+    if not (Path(prototxt).exists() and Path(caffemodel).exists()):
+        print(
+            f"[WARN] DNN model files not found ({prototxt}, {caffemodel}).\n"
+            "       Fallback detector disabled. Download them from:\n"
+            "       https://github.com/opencv/opencv/tree/master/samples/dnn/face_detector"
+        )
+        return None
+    net = cv2.dnn.readNetFromCaffe(prototxt, caffemodel)
+    print("[INFO] OpenCV DNN fallback detector loaded.")
+    return net
+
+
+def detect_dnn(frame: np.ndarray, net, conf_thresh: float = DNN_CONF_THRESH) -> list:
+    """
+    Run the OpenCV DNN face detector on a BGR frame.
+    Returns a list of raw (x1, y1, x2, y2) pixel boxes (no expansion yet).
+    """
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(frame, (300, 300)),
+        scalefactor=1.0,
+        size=(300, 300),
+        mean=(104.0, 177.0, 123.0),
+    )
+    net.setInput(blob)
+    detections = net.forward()
+
+    boxes = []
+    for i in range(detections.shape[2]):
+        conf = float(detections[0, 0, i, 2])
+        if conf < conf_thresh:
+            continue
+        raw = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+        x1, y1, x2, y2 = raw.astype(int)
+        boxes.append((
+            max(0, x1),
+            max(0, y1),
+            min(w, x2),
+            min(h, y2),
+        ))
+    return boxes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN VIDEO PROCESSING
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
-def process_video(input_path, output_path):
+def process_video(input_path: str, output_path: str) -> None:
     """
     Process a single video: detect the patient's face every frame and blur it.
 
     Detection pipeline (in priority order):
-    ┌──────────────────────────────────────────────────────────────────────┐
-    │ 1. MediaPipe FaceDetection → reliable face bbox, handles profiles     │
-    │ 2. Reuse last known position → covers momentary detection dropouts    │
-    │ 3. Black frame → only if no face was ever found (very start of video) │
-    └──────────────────────────────────────────────────────────────────────┘
-
-    WHY ONLY ONE DETECTOR?
-    ----------------------
-    Earlier versions used FaceMesh + Haar cascades in addition to
-    FaceDetection. In practice on side-view clinical footage:
-      - FaceMesh hit 0% (designed for frontal faces)
-      - Haar cascades produced false-positive blur boxes on background objects
-    FaceDetection (model_selection=1) handles both frontal and profile views
-    reliably and is the only detector needed.
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ 1. MediaPipe FaceDetection → reliable face bbox, handles profiles    │
+    │ 2. OpenCV DNN SSD ResNet  → fallback when MediaPipe misses           │
+    │ 3. Reuse last known pos.  → covers short dropout bursts              │
+    │    (box drifts outward by DRIFT_PAD_PER_FRAME px per missed frame)  │
+    │ 4. Black frame            → when no reference exists or streak ≥ cap │
+    └─────────────────────────────────────────────────────────────────────┘
     """
-    print("=" * 60)
+    print("=" * 65)
     print(f"  Input : {input_path}")
     print(f"  Output: {output_path}")
-    print("=" * 60)
+    print("=" * 65)
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print("[ERROR] Failed to open video!")
+        print("[ERROR] Failed to open video.")
         return
 
-    # Read video metadata for the output writer and progress display
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -209,173 +290,176 @@ def process_video(input_path, output_path):
     print(f"  FPS        : {fps:.2f}")
     print(f"  Frames     : {total_frames}")
     print(f"  Duration   : {duration_s:.1f}s")
-    print("-" * 60)
+    print("-" * 65)
 
-    # Output writer — mp4v codec, same resolution and fps as the input
     out = cv2.VideoWriter(
         output_path,
-        cv2.VideoWriter_fourcc(*'mp4v'),
+        cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width, height)
+        (width, height),
     )
 
-    # last_boxes: the most recent face bounding boxes from a successful detection,
-    # after EMA smoothing. Used to:
-    #   (a) filter new detections by proximity (reject false positives)
-    #   (b) blur the face on frames where detection drops out
-    last_boxes  = None
+    dnn_net     = load_dnn_detector()
+    last_boxes  = None   # smoothed boxes from most recent successful detection
+    miss_streak = 0      # consecutive frames without any detection
 
-    # Counters for the end-of-run summary
     frame_count = 0
-    det_hits    = 0   # frames where FaceDetection found the face
-    reuse_hits  = 0   # frames that fell back to last known position
-    blacked     = 0   # frames written black (no detection ever seen)
+    det_mp      = 0   # frames detected by MediaPipe
+    det_dnn     = 0   # frames detected by DNN fallback
+    reuse_hits  = 0   # frames using last-known position
+    blacked     = 0   # frames written black
     start_time  = time.time()
 
     with mp.solutions.face_detection.FaceDetection(
-        model_selection=1,              # 1 = full-range model (up to ~5m)
-                                        # handles both frontal and profile views
-                                        # 0 = short-range (<2m), faster but
-                                        #     worse on profiles
-        min_detection_confidence=0.45   # slightly above default 0.5 to reduce
-                                        # false positives; still catches the face
-                                        # reliably in clinical footage
-    ) as face_detector:
+        model_selection=MP_MODEL_SELECTION,
+        min_detection_confidence=MP_MIN_CONFIDENCE,
+    ) as mp_detector:
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
-                break  # end of video or unreadable frame
+                break
 
             frame_count += 1
             h, w = frame.shape[:2]
 
-            # FaceDetection requires RGB; OpenCV loads frames as BGR
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # ── Progress line every 30 frames ────────────────────────────
+            # ── Progress ──────────────────────────────────────────────────
             if frame_count % 30 == 0 or frame_count == 1:
                 elapsed  = time.time() - start_time
-                pct      = (frame_count / total_frames * 100) if total_frames > 0 else 0
-                fps_proc = frame_count / elapsed if elapsed > 0 else 0
-                eta_s    = (total_frames - frame_count) / fps_proc if fps_proc > 0 else 0
+                pct      = (frame_count / total_frames * 100) if total_frames else 0
+                fps_proc = frame_count / elapsed if elapsed else 0
+                eta_s    = (total_frames - frame_count) / fps_proc if fps_proc else 0
                 print(
                     f"  Frame {frame_count:>5}/{total_frames}"
                     f"  [{pct:5.1f}%]"
                     f"  {fps_proc:5.1f} fps"
                     f"  ETA {eta_s:6.1f}s"
-                    f"  | detected={det_hits}  reuse={reuse_hits}  black={blacked}"
+                    f"  | mp={det_mp} dnn={det_dnn}"
+                    f"  reuse={reuse_hits} black={blacked}"
                 )
 
-            # =============================================================
-            # CASE 1 — FaceDetection fires
-            #
-            # The detector returns bounding boxes in relative [0,1] coords.
-            # We convert to pixels, add a 15px margin so the blur covers the
-            # full face even if the tight detection box clips the edges, then
-            # filter out false positives before blurring.
-            # =============================================================
-            results = face_detector.process(rgb)
+            detected_boxes = None   # will hold new raw boxes if detection fires
+
+            # ─────────────────────────────────────────────────────────────
+            # CASE 1a — MediaPipe FaceDetection
+            # ─────────────────────────────────────────────────────────────
+            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = mp_detector.process(rgb)
 
             if results.detections:
-                new_boxes = []
+                raw_boxes = []
                 for detection in results.detections:
-                    bbox = detection.location_data.relative_bounding_box
+                    b  = detection.location_data.relative_bounding_box
+                    x1 = max(0, int(b.xmin               * w))
+                    y1 = max(0, int(b.ymin               * h))
+                    x2 = min(w, int((b.xmin + b.width)   * w))
+                    y2 = min(h, int((b.ymin + b.height)  * h))
+                    raw_boxes.append((x1, y1, x2, y2))
 
-                    # Scale from relative [0,1] to pixel coordinates
-                    # Clamp to frame boundaries so we never index outside the array
-                    x1 = max(0, int(bbox.xmin                 * w) - 15)
-                    y1 = max(0, int(bbox.ymin                 * h) - 15)
-                    x2 = min(w, int((bbox.xmin + bbox.width)  * w) + 15)
-                    y2 = min(h, int((bbox.ymin + bbox.height) * h) + 15)
-                    new_boxes.append((x1, y1, x2, y2))
+                raw_boxes = filter_by_proximity(
+                    deduplicate_boxes(raw_boxes), last_boxes
+                )
+                if raw_boxes:
+                    detected_boxes = raw_boxes
+                    det_mp += 1
 
-                # Remove overlapping detections of the same face, then reject
-                # any box that has appeared far from the last known face position
-                new_boxes = filter_by_proximity(deduplicate_boxes(new_boxes), last_boxes)
+            # ─────────────────────────────────────────────────────────────
+            # CASE 1b — OpenCV DNN fallback (only if MediaPipe missed)
+            # ─────────────────────────────────────────────────────────────
+            if detected_boxes is None and dnn_net is not None:
+                dnn_boxes = detect_dnn(frame, dnn_net)
+                dnn_boxes = filter_by_proximity(
+                    deduplicate_boxes(dnn_boxes), last_boxes
+                )
+                if dnn_boxes:
+                    detected_boxes = dnn_boxes
+                    det_dnn += 1
 
-                if new_boxes:
-                    # Smooth box positions to prevent frame-to-frame jitter,
-                    # then save as the new reference for future frames
-                    last_boxes  = update_boxes(last_boxes, new_boxes)
-                    det_hits   += 1
+            # ─────────────────────────────────────────────────────────────
+            # Successful detection — update state and blur
+            # ─────────────────────────────────────────────────────────────
+            if detected_boxes is not None:
+                miss_streak = 0
+                last_boxes  = update_boxes(last_boxes, detected_boxes)
 
-                    for box in last_boxes:
-                        blur_face(frame, box)
-
-                    out.write(frame)
-                    continue
-
-            # =============================================================
-            # CASE 2 — No detection this frame: reuse last known position
-            #
-            # FaceDetection occasionally misses a frame due to motion blur,
-            # lighting changes, or an unusually extreme profile angle. The
-            # face has not disappeared — the detector just failed. Reusing
-            # the last known (smoothed) box keeps the blur in the right place
-            # without any visible gap.
-            # =============================================================
-            if last_boxes is not None:
-                reuse_hits += 1
                 for box in last_boxes:
-                    blur_face(frame, box)
+                    blur_face(frame, expand_box(box, w, h))
+
                 out.write(frame)
                 continue
 
-            # =============================================================
-            # CASE 3 — No detection and no history: write a black frame
-            #
-            # This only triggers at the very start of the video before the
-            # first detection has occurred. A black frame is safer than an
-            # unblurred frame because it reveals nothing about the patient.
-            # In a well-lit clinical recording this should affect at most
-            # the first few frames.
-            # =============================================================
+            # ─────────────────────────────────────────────────────────────
+            # CASE 2 — No detection: reuse last known position with drift
+            # ─────────────────────────────────────────────────────────────
+            if last_boxes is not None and miss_streak < MAX_REUSE_FRAMES:
+                miss_streak += 1
+                drift_px = min(miss_streak * DRIFT_PAD_PER_FRAME, DRIFT_PAD_MAX)
+
+                for box in last_boxes:
+                    blur_face(frame, expand_box(box, w, h, extra_px=drift_px))
+
+                reuse_hits += 1
+                out.write(frame)
+                continue
+
+            # ─────────────────────────────────────────────────────────────
+            # CASE 3 — No detection and no usable history → black frame
+            # ─────────────────────────────────────────────────────────────
             blacked += 1
             out.write(np.zeros_like(frame))
 
     cap.release()
     out.release()
 
-    # ── Final summary ─────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────
     elapsed = time.time() - start_time
-    print("-" * 60)
+    print("-" * 65)
     print(f"  DONE in {elapsed:.1f}s")
-    print(f"  Total frames  : {frame_count}")
-    print(f"  Detected      : {det_hits}  ({det_hits/frame_count*100:.1f}%)")
-    print(f"  Reuse         : {reuse_hits}  ({reuse_hits/frame_count*100:.1f}%)")
-    print(f"  Blacked       : {blacked}  ({blacked/frame_count*100:.1f}%)")
-    print(f"  Saved to      : {output_path}")
-    print("=" * 60)
+    print(f"  Total frames      : {frame_count}")
+    if frame_count:
+        print(f"  MediaPipe hits    : {det_mp:>5}  ({det_mp/frame_count*100:.1f}%)")
+        print(f"  DNN fallback hits : {det_dnn:>5}  ({det_dnn/frame_count*100:.1f}%)")
+        print(f"  Reuse (drift)     : {reuse_hits:>5}  ({reuse_hits/frame_count*100:.1f}%)")
+        print(f"  Blacked           : {blacked:>5}  ({blacked/frame_count*100:.1f}%)")
+    print(f"  Saved to          : {output_path}")
+    print("=" * 65)
 
 
-# =============================================================================
-# MULTI-VIDEO BATCH PROCESSING
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH PROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
 
-def process_video_wrapper(video_file):
+def process_folder(input_dir: str, output_dir: str = "processed") -> None:
     """
-    Thin wrapper around process_video for use with ProcessPoolExecutor.
-    Saves output to a 'processed/' subfolder with 'blurred_' prefix.
-    Returns the filename so the caller can log which videos have finished.
+    Process every .mp4 in input_dir sequentially and save results to output_dir.
     """
-    input_path  = str(video_file)
-    output_dir  = Path("processed")
-    output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / f"blurred_{video_file.name}"
+    input_dir  = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[START] {video_file.name}")
-    process_video(input_path, str(output_path))
-    print(f"[DONE]  {video_file.name}")
-    return video_file.name
+    videos = sorted(input_dir.glob("*.mp4"))
+    if not videos:
+        print(f"[WARN] No .mp4 files found in {input_dir}")
+        return
+
+    print(f"[BATCH] {len(videos)} video(s) to process → {output_dir}")
+    for i, video in enumerate(videos, 1):
+        print(f"\n[{i}/{len(videos)}] {video.name}")
+        out_path = output_dir / f"blurred_{video.name}"
+        process_video(str(video), str(out_path))
+    print("\n[BATCH] All done.")
 
 
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
     # ── Single file ──────────────────────────────────────────────────────────
-    process_video(r"C:\Users\zuhai\Documents\AI summer research 2026\Clip_1.mp4", "latestOutput.mp4")
+    process_video(
+        r"",
+        "latestOutput.mp4",
+    )
 
+    
