@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import os
 
-INPUT_VIDEO = r"C:\Users\YoZhang\OneDrive - Shriners Children's\Desktop\SHAPE-UP video\clips\CAN-1-004_baseline\CAN-1-004_baseline_front_task_6.mp4"
+INPUT_VIDEO = r"C:\Users\YoZhang\OneDrive - Shriners Children's\Desktop\SHAPE-UP video\clips\GRE-1-002_baseline_side_task_7.mp4"
 
 OUTPUT_FOLDER = r"C:\Users\YoZhang\OneDrive - Shriners Children's\Desktop\SHAPE-UP video\blurred videos"
 
@@ -15,11 +15,11 @@ DISPLAY_SCALE = 0.35
 START_FRAME = 0
 
 # 头被挡住/Tracker跟丢后，继续用最后位置遮挡几秒
-FALLBACK_SECONDS = 3
+FALLBACK_SECONDS =0.1
 
 # 马赛克大小，相对于你框住的头部区域
-EYE_MASK_WIDTH_SCALE = 1.5
-EYE_MASK_HEIGHT_SCALE = 1.0
+EYE_MASK_WIDTH_SCALE = 2
+EYE_MASK_HEIGHT_SCALE= 2
 
 # 马赛克位置，相对于你框住的头部区域
 EYE_CENTER_X_RATIO = 0.50
