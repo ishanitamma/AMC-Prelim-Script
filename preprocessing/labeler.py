@@ -57,8 +57,7 @@ DEFAULT_BODYPARTS = [
     "left_thumbtip",
     "left_indexmcp",
     "left_indextip",
-    "left_middlemcp",
-    "mid_spine",
+    "left_middlemcp"
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,8 +108,7 @@ COLORS = [
     (100, 255, 0),     # left_thumbtip    — green
     (0,   255, 60),    # left_indexmcp    — teal-green
     (0,   255, 180),   # left_indextip    — teal
-    (0,   200, 200),   # left_middlemcp   — dark teal
-    (128, 128, 255),   # mid_spine        — light blue
+    (0,   200, 200)   # left_middlemcp   — dark teal
 ]
 
 # Color for the computed trunk_midpoint overlay (not labeled — shown as reference)
