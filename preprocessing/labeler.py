@@ -92,7 +92,7 @@ TRUNK_REQUIRES = {
 # COLORS — one per keypoint (BGR), must match DEFAULT_BODYPARTS order
 # ─────────────────────────────────────────────────────────────────────────────
 COLORS = [
-    (0,   255, 100),   # nose             — bright green
+    (0,   255, 100),   # chin             — bright green
     (0,   200, 255),   # right_shoulder   — yellow
     (0,   120, 255),   # right_elbow      — orange
     (0,   60,  255),   # right_wrist      — deep orange
@@ -109,6 +109,7 @@ COLORS = [
     (0,   255, 60),    # left_indexmcp    — teal-green
     (0,   255, 180),   # left_indextip    — teal
     (0,   200, 200)   # left_middlemcp   — dark teal
+    
 ]
 
 # Color for the computed trunk_midpoint overlay (not labeled — shown as reference)
@@ -201,7 +202,7 @@ def draw_sidebar(canvas, bodyparts, current_bp_idx, labels, img_h):
              (80, 80, 80), 1)
 
     for i, bp in enumerate(bodyparts):
-        y       = 56 + i * 26
+        y       = 56 + i * 34
         color   = clamp_color(i)
         labeled = labels.get(bp) is not None
 
@@ -220,7 +221,7 @@ def draw_sidebar(canvas, bodyparts, current_bp_idx, labels, img_h):
         text   = f"{status} {bp}"
         cv2.putText(canvas, text,
                     (canvas.shape[1] - PANEL_WIDTH + 30, y + 4),
-                    FONT, 0.38,
+                    FONT, 0.52,
                     (220, 220, 220) if i == current_bp_idx else (160, 160, 160),
                     1, cv2.LINE_AA)
 
@@ -284,9 +285,7 @@ def draw_labels_on_image(img, labels, bodyparts, current_bp_idx, zoom_factor=1.0
         cv2.circle(out, (x, y), radius, color, thick)
         cv2.circle(out, (x, y), 2, (255, 255, 255), -1)
 
-        tx, ty = x + radius + 3, y - radius
-        cv2.putText(out, bp, (tx + 1, ty + 1), FONT, 0.35, (0, 0, 0),  2, cv2.LINE_AA)
-        cv2.putText(out, bp, (tx,     ty),     FONT, 0.35, color,        1, cv2.LINE_AA)
+
 
     # Draw computed trunk midpoint (yellow diamond — visually distinct from manual points)
     tp = compute_trunk_midpoint(labels)
@@ -321,12 +320,7 @@ def draw_labels_on_image(img, labels, bodyparts, current_bp_idx, zoom_factor=1.0
                      (TRUNK_MIDPOINT_COLOR[0]//2, TRUNK_MIDPOINT_COLOR[1]//2, 0),
                      1, cv2.LINE_AA)
 
-        cv2.putText(out, "trunk_midpoint [auto]",
-                    (tx + size + 3, ty + 4),
-                    FONT, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
-        cv2.putText(out, "trunk_midpoint [auto]",
-                    (tx + size + 3, ty + 4),
-                    FONT, 0.35, TRUNK_MIDPOINT_COLOR, 1, cv2.LINE_AA)
+
 
     return out
 
